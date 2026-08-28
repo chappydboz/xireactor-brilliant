@@ -27,6 +27,7 @@ uv pip install -r requirements.txt
 | `MCP_BASE_URL` | `http://localhost:8011` | External URL for OAuth issuer (remote only) |
 | `MCP_PORT` | `8001` | Port for remote HTTP server |
 | `TOKEN_EXPIRY_SECONDS` | `3600` | OAuth access token lifetime |
+| `REFRESH_TOKEN_EXPIRY_SECONDS` | `31536000` | Maximum lifetime for a rotating refresh token; replacements retain the original deadline |
 | `OAUTH_HANDOFF_SECRET` | *(required remote)* | HMAC secret shared with API for `/oauth/login` → `/oauth/continue` handoff |
 
 ## Claude Desktop Integration (Stdio)
@@ -57,6 +58,8 @@ Restart Claude Desktop after editing the config. The 11 Brilliant tools will app
 1. The MCP server runs as a container alongside the Brilliant API
 2. Claude Co-work connects via OAuth 2.1 (Dynamic Client Registration + PKCE)
 3. After auth, Co-work users get access to all 11 Brilliant tools in their conversations
+4. The remote transport is intentionally **stateless**. Do not depend on a persistent `Mcp-Session-Id`; each HTTP request is independently authenticated and may be handled by either worker. This avoids cross-worker `Session not found` failures without changing API-key authentication.
+5. Access tokens default to one hour. A refresh token can renew access without reopening the browser for up to 365 days from initial authorization; rotation never extends that absolute deadline.
 
 ### Admin setup: Add custom connector
 

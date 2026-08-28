@@ -639,6 +639,11 @@ mcp = FastMCP(
     name="brilliant",
     host="0.0.0.0",
     port=MCP_PORT,
+    # FastMCP's stateful transport keeps session IDs, stream registries, and
+    # ownership maps in each worker's memory. Stateless HTTP keeps every
+    # request self-contained, allowing a two-worker deployment without
+    # cross-worker "Session not found" failures.
+    stateless_http=True,
     auth_server_provider=provider,
     auth=AuthSettings(
         issuer_url=MCP_BASE_URL,

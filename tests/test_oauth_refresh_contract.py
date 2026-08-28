@@ -70,6 +70,56 @@ def test_offline_access_is_a_discoverable_supported_scope() -> None:
     assert options.default_scopes == ["brilliant"]
 
 
+def test_beehive_mcp_transport_is_stateless_for_multi_worker_safety() -> None:
+    """The production MCP configuration must not retain worker-local sessions."""
+    assert mcp.settings.stateless_http is True
+
+
+def test_stateless_transport_allows_sequential_requests_without_session_id() -> None:
+    """A second request works without a process-local `Mcp-Session-Id` map."""
+    from mcp.server.fastmcp import FastMCP
+    from starlette.testclient import TestClient
+
+    probe = FastMCP("stateless-probe", json_response=True, stateless_http=True)
+
+    @probe.tool()
+    async def ping() -> str:
+        return "pong"
+
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "mcp-protocol-version": "2025-11-25",
+    }
+    with TestClient(
+        probe.streamable_http_app(), base_url="http://localhost:8000"
+    ) as client:
+        initialize = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "stateless-test", "version": "1.0"},
+                },
+            },
+        )
+        assert initialize.status_code == 200
+        assert "mcp-session-id" not in initialize.headers
+
+        tools_list = client.post(
+            "/mcp",
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+        assert tools_list.status_code == 200
+        assert tools_list.json()["result"]["tools"][0]["name"] == "ping"
+
+
 def test_public_client_method_is_advertised_in_authorization_metadata() -> None:
     """RFC 8414 metadata must identify `none` for public PKCE clients."""
     response = _public_client_authorization_metadata(SimpleNamespace())
