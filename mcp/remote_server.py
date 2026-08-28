@@ -40,7 +40,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, RedirectResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 
 from client import BrilliantClient
 from oauth_store import PgOAuthStore
@@ -645,6 +645,66 @@ mcp.settings.debug = False
 
 
 # ---------------------------------------------------------------------------
+# Authorization-server metadata — public PKCE client compatibility
+# ---------------------------------------------------------------------------
+
+
+def _public_client_authorization_metadata(request: Request) -> Response:
+    """Return RFC 8414 metadata including public-client authentication.
+
+    FastMCP 1.x has a fixed metadata builder that advertises only the two
+    client-secret methods even though its ``ClientAuthenticator`` supports
+    ``token_endpoint_auth_method=none``. Claude Code uses a public PKCE client
+    and needs that method advertised in discovery. Build the standard metadata
+    through FastMCP, then make the one interoperability correction here instead
+    of duplicating endpoint URLs, scopes, PKCE, registration, or revocation
+    configuration.
+    """
+    from mcp.server.auth.routes import build_metadata
+
+    auth_settings = mcp.settings.auth
+    if auth_settings is None:
+        raise RuntimeError("OAuth metadata requested while authentication is disabled")
+
+    metadata = build_metadata(
+        issuer_url=auth_settings.issuer_url,
+        service_documentation_url=auth_settings.service_documentation_url,
+        client_registration_options=auth_settings.client_registration_options
+        or ClientRegistrationOptions(),
+        revocation_options=auth_settings.revocation_options or RevocationOptions(),
+    )
+    methods = metadata.token_endpoint_auth_methods_supported or []
+    if "none" not in methods:
+        metadata.token_endpoint_auth_methods_supported = ["none", *methods]
+
+    return JSONResponse(
+        metadata.model_dump(mode="json", exclude_none=True),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _install_public_client_metadata_route(app) -> None:
+    """Replace FastMCP's fixed metadata route with the compatible response.
+
+    The SDK composes its routes before application-specific custom routes, so a
+    duplicate route would never be reached. Replacing the exact generated route
+    keeps its path and the rest of the SDK OAuth flow intact.
+    """
+    from starlette.routing import Route
+
+    metadata_path = "/.well-known/oauth-authorization-server"
+    for index, route in enumerate(app.routes):
+        if getattr(route, "path", None) == metadata_path:
+            app.routes[index] = Route(
+                metadata_path,
+                endpoint=_public_client_authorization_metadata,
+                methods=["GET", "OPTIONS"],
+            )
+            return
+    raise RuntimeError("FastMCP authorization metadata route was not installed")
+
+
+# ---------------------------------------------------------------------------
 # /oauth/continue — consume the signed handoff from the API's login POST
 # ---------------------------------------------------------------------------
 #
@@ -776,6 +836,7 @@ register_tools(mcp, api)
 def create_app():
     """Create the Starlette ASGI app with CORS middleware for deployment."""
     app = mcp.streamable_http_app()
+    _install_public_client_metadata_route(app)
 
     # Wrap with CORS middleware
     from starlette.middleware.cors import CORSMiddleware
