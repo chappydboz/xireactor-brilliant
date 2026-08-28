@@ -101,6 +101,9 @@ services:
       BRILLIANT_API_KEY: ${BRILLIANT_API_KEY:-}
       MCP_BASE_URL: ${MCP_BASE_URL:-http://localhost:8011}
       MCP_PORT: "8001"
+      # Absolute OAuth refresh-token lifetime. A replacement token inherits
+      # this deadline rather than extending the authorization indefinitely.
+      REFRESH_TOKEN_EXPIRY_SECONDS: ${REFRESH_TOKEN_EXPIRY_SECONDS:-31536000}
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-dev}@db:5432/${POSTGRES_DB:-brilliant}
       OAUTH_HANDOFF_SECRET: ${OAUTH_HANDOFF_SECRET:-}
       # Service key for MCP→API server-to-server calls. mcp presents this

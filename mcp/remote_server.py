@@ -197,6 +197,12 @@ def _resolve_mcp_base_url() -> str:
 
 MCP_BASE_URL = _resolve_mcp_base_url()
 TOKEN_EXPIRY_SECONDS = int(os.environ.get("TOKEN_EXPIRY_SECONDS", "3600"))
+# Refresh tokens remain usable for one year from initial authorization. A
+# rotated token inherits the original absolute deadline, so regular use does
+# not create an indefinitely renewable credential.
+REFRESH_TOKEN_EXPIRY_SECONDS = int(
+    os.environ.get("REFRESH_TOKEN_EXPIRY_SECONDS", str(365 * 24 * 60 * 60))
+)
 
 # -- Sprint 0039: OAuth handoff ----------------------------------------------
 #
@@ -503,6 +509,7 @@ class BrilliantOAuthProvider(
             token=refresh_token_str,
             client_id=client.client_id,
             scopes=authorization_code.scopes,
+            expires_at=int(time.time()) + REFRESH_TOKEN_EXPIRY_SECONDS,
         )
         await self.store.save_refresh_token(refresh_token)
 
@@ -545,8 +552,20 @@ class BrilliantOAuthProvider(
     async def exchange_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
     ) -> OAuthToken:
-        # Revoke old refresh token
-        await self.store.delete_refresh_token(refresh_token.token)
+        # Atomically consume the old refresh token before issuing its
+        # replacement. This detects a concurrent replay instead of allowing
+        # two callers to rotate the same credential successfully.
+        consumed_refresh_token = await self.store.consume_refresh_token(
+            refresh_token.token,
+            client.client_id,
+        )
+        if consumed_refresh_token is None:
+            from mcp.server.auth.provider import TokenError
+
+            raise TokenError(
+                error="invalid_grant",
+                error_description="refresh token is expired, revoked, or already used",
+            )
 
         # Preserve the user_id binding across refresh. The old access
         # token(s) for this refresh may already be expired or consumed,
@@ -578,7 +597,7 @@ class BrilliantOAuthProvider(
         access_token = AccessToken(
             token=access_token_str,
             client_id=client.client_id,
-            scopes=scopes or refresh_token.scopes,
+            scopes=scopes or consumed_refresh_token.scopes,
             expires_at=int(time.time()) + TOKEN_EXPIRY_SECONDS,
         )
         await self.store.save_access_token(access_token, user_id=bound_user_id)
@@ -587,7 +606,10 @@ class BrilliantOAuthProvider(
         new_refresh = RefreshToken(
             token=new_refresh_str,
             client_id=client.client_id,
-            scopes=scopes or refresh_token.scopes,
+            scopes=scopes or consumed_refresh_token.scopes,
+            # Absolute lifetime: rotation never extends the original one-year
+            # authorization window.
+            expires_at=consumed_refresh_token.expires_at,
         )
         await self.store.save_refresh_token(new_refresh)
 

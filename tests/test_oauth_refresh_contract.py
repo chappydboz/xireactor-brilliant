@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,9 +22,12 @@ if str(MCP_DIR) not in sys.path:
     sys.path.insert(0, str(MCP_DIR))
 
 from mcp.server.auth.middleware.client_auth import ClientAuthenticator  # noqa: E402
+from mcp.server.auth.provider import RefreshToken, TokenError  # noqa: E402
 from mcp.shared.auth import OAuthClientInformationFull  # noqa: E402
+import remote_server  # noqa: E402
 from remote_server import (  # noqa: E402
     BrilliantOAuthProvider,
+    REFRESH_TOKEN_EXPIRY_SECONDS,
     _public_client_authorization_metadata,
     create_app,
     mcp,
@@ -36,6 +41,8 @@ class _MemoryStore:
         self.deleted_codes: list[str] = []
         self.access_tokens = []
         self.refresh_tokens = []
+        self.consumed_refresh_tokens: list[str] = []
+        self._refresh_by_token = {}
 
     async def delete_auth_code(self, code: str) -> None:
         self.deleted_codes.append(code)
@@ -45,6 +52,14 @@ class _MemoryStore:
 
     async def save_refresh_token(self, token) -> None:
         self.refresh_tokens.append(token)
+        self._refresh_by_token[token.token] = token
+
+    async def consume_refresh_token(self, token: str, client_id: str):
+        refresh_token = self._refresh_by_token.pop(token, None)
+        if refresh_token is None or refresh_token.client_id != client_id:
+            return None
+        self.consumed_refresh_tokens.append(token)
+        return refresh_token
 
 
 def test_offline_access_is_a_discoverable_supported_scope() -> None:
@@ -156,3 +171,51 @@ def test_authorization_code_exchange_returns_a_refresh_token() -> None:
     assert store.access_tokens[0][1] == "test-user"
     assert len(store.refresh_tokens) == 1
     assert store.refresh_tokens[0].scopes == ["brilliant", "offline_access"]
+
+
+def test_new_refresh_token_has_an_exact_one_year_absolute_lifetime(monkeypatch) -> None:
+    """Initial authorization grants one calendar-year-equivalent TTL."""
+    fixed_time = 1_700_000_000
+    monkeypatch.setattr(remote_server.time, "time", lambda: fixed_time)
+    store = _MemoryStore()
+    provider = BrilliantOAuthProvider(store)
+    client = SimpleNamespace(client_id="test-claude-code-client")
+    code = SimpleNamespace(
+        code="test-authorization-code",
+        scopes=["brilliant", "offline_access"],
+        user_id="test-user",
+    )
+
+    asyncio.run(provider.exchange_authorization_code(client, code))
+
+    assert REFRESH_TOKEN_EXPIRY_SECONDS == 365 * 24 * 60 * 60
+    assert store.refresh_tokens[0].expires_at == (
+        fixed_time + REFRESH_TOKEN_EXPIRY_SECONDS
+    )
+
+
+def test_refresh_rotation_preserves_absolute_expiry_and_rejects_replay() -> None:
+    """Rotation changes the secret without extending its original deadline."""
+    store = _MemoryStore()
+    provider = BrilliantOAuthProvider(store)
+    client = SimpleNamespace(client_id="test-claude-code-client")
+    original = RefreshToken(
+        token="test-original-refresh-token",
+        client_id=client.client_id,
+        scopes=["brilliant", "offline_access"],
+        expires_at=2_000_000_000,
+    )
+    asyncio.run(store.save_refresh_token(original))
+
+    issued = asyncio.run(
+        provider.exchange_refresh_token(client, original, original.scopes)
+    )
+
+    assert issued.refresh_token
+    assert issued.refresh_token != original.token
+    assert store.consumed_refresh_tokens == [original.token]
+    assert store.refresh_tokens[-1].expires_at == original.expires_at
+
+    with pytest.raises(TokenError) as replay_error:
+        asyncio.run(provider.exchange_refresh_token(client, original, original.scopes))
+    assert replay_error.value.error == "invalid_grant"

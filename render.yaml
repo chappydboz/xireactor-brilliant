@@ -208,6 +208,12 @@ services:
       - key: TOKEN_EXPIRY_SECONDS
         value: "3600"
 
+      # Absolute maximum lifetime for OAuth refresh tokens. A rotated token
+      # inherits the original deadline; this avoids an indefinitely renewable
+      # connector credential while allowing browser-free reuse for one year.
+      - key: REFRESH_TOKEN_EXPIRY_SECONDS
+        value: "31536000"
+
       # --- OAuth user-binding handoff (sprint 0039) ---
       # Shared HMAC secret — API generates on first deploy, MCP reads
       # back via Render's fromService.envVarKey. The MCP uses this to

@@ -232,19 +232,27 @@ class PgOAuthStore:
     # -- Refresh Tokens --------------------------------------------------------
 
     async def save_refresh_token(self, token: RefreshToken) -> None:
+        """Persist a refresh token with its non-renewable absolute expiry."""
         async with await self._conn() as conn:
             await conn.execute(
-                """INSERT INTO oauth_refresh_tokens (token, client_id, scopes)
-                   VALUES (%s, %s, %s)""",
-                (token.token, token.client_id, token.scopes or []),
+                """INSERT INTO oauth_refresh_tokens (token, client_id, scopes, expires_at)
+                   VALUES (%s, %s, %s, %s)""",
+                (
+                    token.token,
+                    token.client_id,
+                    token.scopes or [],
+                    token.expires_at,
+                ),
             )
 
     async def get_refresh_token(self, token: str, client_id: str) -> RefreshToken | None:
+        """Load a refresh token only when it remains within its absolute TTL."""
         async with await self._conn() as conn:
             row = await (
                 await conn.execute(
-                    "SELECT * FROM oauth_refresh_tokens WHERE token = %s AND client_id = %s",
-                    (token, client_id),
+                    """SELECT * FROM oauth_refresh_tokens
+                       WHERE token = %s AND client_id = %s AND expires_at > %s""",
+                    (token, client_id, int(time.time())),
                 )
             ).fetchone()
         if row is None:
@@ -253,6 +261,34 @@ class PgOAuthStore:
             token=row["token"],
             client_id=row["client_id"],
             scopes=row["scopes"] or [],
+            expires_at=row["expires_at"],
+        )
+
+    async def consume_refresh_token(
+        self, token: str, client_id: str
+    ) -> RefreshToken | None:
+        """Atomically consume a valid refresh token for one-time rotation.
+
+        A `DELETE ... RETURNING` prevents two concurrent refresh requests from
+        both succeeding with the same token. Expired tokens are not returned and
+        are swept independently.
+        """
+        async with await self._conn() as conn:
+            row = await (
+                await conn.execute(
+                    """DELETE FROM oauth_refresh_tokens
+                       WHERE token = %s AND client_id = %s AND expires_at > %s
+                       RETURNING token, client_id, scopes, expires_at""",
+                    (token, client_id, int(time.time())),
+                )
+            ).fetchone()
+        if row is None:
+            return None
+        return RefreshToken(
+            token=row["token"],
+            client_id=row["client_id"],
+            scopes=row["scopes"] or [],
+            expires_at=row["expires_at"],
         )
 
     async def delete_refresh_token(self, token: str) -> None:
@@ -359,7 +395,7 @@ class PgOAuthStore:
     # -- Cleanup ---------------------------------------------------------------
 
     async def sweep_expired(self) -> int:
-        """Delete expired auth codes, access tokens, and pending authz. Returns total rows deleted."""
+        """Delete expired OAuth artifacts, including refresh tokens. Returns rows deleted."""
         now = time.time()
         total = 0
         async with await self._conn() as conn:
@@ -374,7 +410,16 @@ class PgOAuthStore:
                 "DELETE FROM oauth_pending_authorizations WHERE expires_at <= %s",
                 (now,),
             )
-            total = (r1.rowcount or 0) + (r2.rowcount or 0) + (r3.rowcount or 0)
+            r4 = await conn.execute(
+                "DELETE FROM oauth_refresh_tokens WHERE expires_at <= %s",
+                (now,),
+            )
+            total = (
+                (r1.rowcount or 0)
+                + (r2.rowcount or 0)
+                + (r3.rowcount or 0)
+                + (r4.rowcount or 0)
+            )
         if total > 0:
             logger.info("Swept %d expired OAuth rows", total)
         return total
