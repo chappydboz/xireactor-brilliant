@@ -629,7 +629,10 @@ mcp = FastMCP(
         # for unknown paths). See mcp/server/auth/routes.py.
         client_registration_options=ClientRegistrationOptions(
             enabled=False,
-            valid_scopes=["brilliant"],
+            # Claude Code requests offline_access only when the authorization
+            # server advertises it. Preserve the least-privilege default while
+            # allowing the public PKCE client to request a refresh token.
+            valid_scopes=["brilliant", "offline_access"],
             default_scopes=["brilliant"],
         ),
         revocation_options=RevocationOptions(enabled=True),
