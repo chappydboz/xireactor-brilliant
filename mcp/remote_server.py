@@ -428,11 +428,12 @@ class BrilliantOAuthProvider(
         # that method is always literal "S256" before dropping it. We
         # persist "S256" explicitly so the column isn't misleadingly NULL.
         code_challenge_method = "S256" if params.code_challenge else None
+        scopes = params.scopes if params.scopes else ["brilliant", "offline_access"]
 
         await self.store.save_pending_authorization(
             tx_id,
             client_id=client.client_id,
-            scopes=params.scopes or [],
+            scopes=scopes,
             code_challenge=params.code_challenge,
             code_challenge_method=code_challenge_method,
             redirect_uri=str(params.redirect_uri),
@@ -501,20 +502,26 @@ class BrilliantOAuthProvider(
         # Consume the authorization code
         await self.store.delete_auth_code(authorization_code.code)
 
-        # Issue access token
+        # Issue access token with default scopes if empty
+        scopes = (
+            authorization_code.scopes
+            if authorization_code.scopes
+            else ["brilliant", "offline_access"]
+        )
         access_token_str = secrets.token_hex(32)
         access_token = AccessToken(
             token=access_token_str,
             client_id=client.client_id,
-            scopes=authorization_code.scopes,
+            scopes=scopes,
             expires_at=int(time.time()) + TOKEN_EXPIRY_SECONDS,
         )
         await self.store.save_access_token(access_token, user_id=bound_user_id)
         logger.warning(
-            "Token ISSUED: prefix=%s, expires_at=%s, user_id=%s",
+            "Token ISSUED: prefix=%s, expires_at=%s, user_id=%s, scopes=%s",
             access_token_str[:8] + "...",
             access_token.expires_at,
             bound_user_id,
+            scopes,
         )
 
         # Issue refresh token
@@ -522,7 +529,7 @@ class BrilliantOAuthProvider(
         refresh_token = RefreshToken(
             token=refresh_token_str,
             client_id=client.client_id,
-            scopes=authorization_code.scopes,
+            scopes=scopes,
             expires_at=int(time.time()) + REFRESH_TOKEN_EXPIRY_SECONDS,
         )
         await self.store.save_refresh_token(refresh_token)
@@ -531,7 +538,7 @@ class BrilliantOAuthProvider(
             access_token=access_token_str,
             token_type="Bearer",
             expires_in=TOKEN_EXPIRY_SECONDS,
-            scope=" ".join(authorization_code.scopes) if authorization_code.scopes else None,
+            scope=" ".join(scopes) if scopes else None,
             refresh_token=refresh_token_str,
         )
 
@@ -562,7 +569,7 @@ class BrilliantOAuthProvider(
                             return BrilliantAccessToken(
                                 token=token,
                                 client_id="cortex_34c3aeb772906662ff042acf4ac206ef",
-                                scopes=["brilliant"],
+                                scopes=["brilliant", "offline_access"],
                                 expires_at=int(time.time()) + 3600,
                                 user_id=user_id,
                             )
@@ -580,8 +587,12 @@ class BrilliantOAuthProvider(
                 time.time(),
             )
             return None
+        scopes = at.scopes if at.scopes else ["brilliant", "offline_access"]
         return BrilliantAccessToken(
-            **at.model_dump(),
+            token=at.token,
+            client_id=at.client_id,
+            scopes=scopes,
+            expires_at=at.expires_at,
             user_id=user_id,
         )
 
@@ -631,23 +642,29 @@ class BrilliantOAuthProvider(
                 if row and row.get("user_id"):
                     bound_user_id = row["user_id"]
         except Exception as exc:  # noqa: BLE001 — tolerate DB hiccups on refresh
-            logger.warning("refresh: could not resolve bound user_id: %s", exc)
+            logger.warning("exchange_refresh: user_id lookup failed: %s", exc)
 
-        # Issue new tokens
+        # Issue access token
+        effective_scopes = (
+            scopes
+            or consumed_refresh_token.scopes
+            or ["brilliant", "offline_access"]
+        )
         access_token_str = secrets.token_hex(32)
         access_token = AccessToken(
             token=access_token_str,
             client_id=client.client_id,
-            scopes=scopes or consumed_refresh_token.scopes,
+            scopes=effective_scopes,
             expires_at=int(time.time()) + TOKEN_EXPIRY_SECONDS,
         )
         await self.store.save_access_token(access_token, user_id=bound_user_id)
 
+        # Issue new refresh token preserving the original absolute expiry
         new_refresh_str = secrets.token_hex(32)
         new_refresh = RefreshToken(
             token=new_refresh_str,
             client_id=client.client_id,
-            scopes=scopes or consumed_refresh_token.scopes,
+            scopes=effective_scopes,
             # Absolute lifetime: rotation never extends the original one-year
             # authorization window.
             expires_at=consumed_refresh_token.expires_at,
@@ -658,7 +675,7 @@ class BrilliantOAuthProvider(
             access_token=access_token_str,
             token_type="Bearer",
             expires_in=TOKEN_EXPIRY_SECONDS,
-            scope=" ".join(access_token.scopes) if access_token.scopes else None,
+            scope=" ".join(effective_scopes) if effective_scopes else None,
             refresh_token=new_refresh_str,
         )
 
@@ -688,11 +705,8 @@ mcp = FastMCP(
     auth_server_provider=provider,
     auth=AuthSettings(
         issuer_url=MCP_BASE_URL,
-        resource_server_url=MCP_BASE_URL,
-        # Sprint 0039: DCR disabled. Clients are pre-provisioned by
-        # /setup on the API service; Claude Co-work's custom connector
-        # requires the operator to paste client_id + client_secret.
-        # With enabled=False the SDK does not mount the /register route
+        service_documentation_url="https://github.com/thejeremyhodge/xireactor-brilliant",
+        # Client registration is disabled. FastMCP will NOT mount /register
         # at all — a POST to /register returns 404 (Starlette default
         # for unknown paths). See mcp/server/auth/routes.py.
         client_registration_options=ClientRegistrationOptions(
@@ -701,7 +715,7 @@ mcp = FastMCP(
             # server advertises it. Preserve the least-privilege default while
             # allowing the public PKCE client to request a refresh token.
             valid_scopes=["brilliant", "offline_access"],
-            default_scopes=["brilliant"],
+            default_scopes=["brilliant", "offline_access"],
         ),
         revocation_options=RevocationOptions(enabled=True),
         required_scopes=[],
@@ -718,16 +732,7 @@ mcp.settings.debug = False
 
 
 def _public_client_authorization_metadata(request: Request) -> Response:
-    """Return RFC 8414 metadata including public-client authentication.
-
-    FastMCP 1.x has a fixed metadata builder that advertises only the two
-    client-secret methods even though its ``ClientAuthenticator`` supports
-    ``token_endpoint_auth_method=none``. Claude Code uses a public PKCE client
-    and needs that method advertised in discovery. Build the standard metadata
-    through FastMCP, then make the one interoperability correction here instead
-    of duplicating endpoint URLs, scopes, PKCE, registration, or revocation
-    configuration.
-    """
+    """Return RFC 8414 metadata including public-client authentication."""
     from mcp.server.auth.routes import build_metadata
 
     auth_settings = mcp.settings.auth
@@ -744,6 +749,10 @@ def _public_client_authorization_metadata(request: Request) -> Response:
     methods = metadata.token_endpoint_auth_methods_supported or []
     if "none" not in methods:
         metadata.token_endpoint_auth_methods_supported = ["none", *methods]
+    if not metadata.scopes_supported:
+        metadata.scopes_supported = ["brilliant", "offline_access"]
+    elif "offline_access" not in metadata.scopes_supported:
+        metadata.scopes_supported = [*metadata.scopes_supported, "offline_access"]
 
     return JSONResponse(
         metadata.model_dump(mode="json", exclude_none=True),
@@ -751,33 +760,41 @@ def _public_client_authorization_metadata(request: Request) -> Response:
     )
 
 
-def _install_public_client_metadata_route(app) -> None:
-    """Replace FastMCP's fixed metadata routes with the compatible response.
+def _protected_resource_metadata(request: Request) -> Response:
+    """Return RFC 9728 OAuth Protected Resource Metadata."""
+    return JSONResponse(
+        {
+            "resource": MCP_BASE_URL,
+            "authorization_servers": [MCP_BASE_URL],
+            "scopes_supported": ["brilliant", "offline_access"],
+            "bearer_methods_supported": ["header"],
+        },
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
-    The SDK composes its routes before application-specific custom routes, so a
-    duplicate route would never be reached. Replacing the exact generated routes
-    keeps its paths and the rest of the SDK OAuth flow intact.
-    """
+
+def _install_public_client_metadata_route(app) -> None:
+    """Ensure all standard RFC 8414 & OpenID metadata paths are served."""
     from starlette.routing import Route
 
-    target_paths = {
+    as_paths = [
         "/.well-known/oauth-authorization-server",
-        "/.well-known/oauth-authorization-server/{path:path}",
+        "/.well-known/oauth-authorization-server/mcp",
         "/.well-known/openid-configuration",
-        "/.well-known/openid-configuration/{path:path}",
-    }
-    found = False
-    for index, route in enumerate(app.routes):
-        r_path = getattr(route, "path", None)
-        if r_path in target_paths:
-            app.routes[index] = Route(
-                r_path,
-                endpoint=_public_client_authorization_metadata,
-                methods=["GET", "OPTIONS"],
-            )
-            found = True
-    if not found:
-        raise RuntimeError("FastMCP authorization metadata route was not installed")
+        "/.well-known/openid-configuration/mcp",
+    ]
+    pr_paths = [
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+    ]
+
+    target_set = set(as_paths + pr_paths)
+    app.routes = [r for r in app.routes if getattr(r, "path", None) not in target_set]
+
+    for p in reversed(as_paths):
+        app.routes.insert(0, Route(p, endpoint=_public_client_authorization_metadata, methods=["GET", "OPTIONS"]))
+    for p in reversed(pr_paths):
+        app.routes.insert(0, Route(p, endpoint=_protected_resource_metadata, methods=["GET", "OPTIONS"]))
 
 
 # ---------------------------------------------------------------------------
