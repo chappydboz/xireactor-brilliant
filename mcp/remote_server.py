@@ -752,24 +752,32 @@ def _public_client_authorization_metadata(request: Request) -> Response:
 
 
 def _install_public_client_metadata_route(app) -> None:
-    """Replace FastMCP's fixed metadata route with the compatible response.
+    """Replace FastMCP's fixed metadata routes with the compatible response.
 
     The SDK composes its routes before application-specific custom routes, so a
-    duplicate route would never be reached. Replacing the exact generated route
-    keeps its path and the rest of the SDK OAuth flow intact.
+    duplicate route would never be reached. Replacing the exact generated routes
+    keeps its paths and the rest of the SDK OAuth flow intact.
     """
     from starlette.routing import Route
 
-    metadata_path = "/.well-known/oauth-authorization-server"
+    target_paths = {
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-authorization-server/{path:path}",
+        "/.well-known/openid-configuration",
+        "/.well-known/openid-configuration/{path:path}",
+    }
+    found = False
     for index, route in enumerate(app.routes):
-        if getattr(route, "path", None) == metadata_path:
+        r_path = getattr(route, "path", None)
+        if r_path in target_paths:
             app.routes[index] = Route(
-                metadata_path,
+                r_path,
                 endpoint=_public_client_authorization_metadata,
                 methods=["GET", "OPTIONS"],
             )
-            return
-    raise RuntimeError("FastMCP authorization metadata route was not installed")
+            found = True
+    if not found:
+        raise RuntimeError("FastMCP authorization metadata route was not installed")
 
 
 # ---------------------------------------------------------------------------
