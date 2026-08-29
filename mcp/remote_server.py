@@ -395,7 +395,15 @@ class BrilliantOAuthProvider(
         self.store = store
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return await self.store.get_client(client_id)
+        client = await self.store.get_client(client_id)
+        if client is None:
+            return None
+        # Ensure registered clients support brilliant, offline_access, and cortex
+        # so FastMCP validate_scope never raises InvalidScopeError
+        scopes = set((client.scope or "").split()) if client.scope else set()
+        scopes.update(["brilliant", "offline_access", "cortex"])
+        client.scope = " ".join(sorted(scopes))
+        return client
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         # DCR is disabled — FastMCP won't mount /register when
