@@ -790,12 +790,12 @@ def _install_public_client_metadata_route(app) -> None:
     ]
 
     target_set = set(as_paths + pr_paths)
-    app.routes = [r for r in app.routes if getattr(r, "path", None) not in target_set]
+    app.router.routes = [r for r in app.router.routes if getattr(r, "path", None) not in target_set]
 
     for p in reversed(as_paths):
-        app.routes.insert(0, Route(p, endpoint=_public_client_authorization_metadata, methods=["GET", "OPTIONS"]))
+        app.router.routes.insert(0, Route(p, endpoint=_public_client_authorization_metadata, methods=["GET", "OPTIONS"]))
     for p in reversed(pr_paths):
-        app.routes.insert(0, Route(p, endpoint=_protected_resource_metadata, methods=["GET", "OPTIONS"]))
+        app.router.routes.insert(0, Route(p, endpoint=_protected_resource_metadata, methods=["GET", "OPTIONS"]))
 
 
 # ---------------------------------------------------------------------------
