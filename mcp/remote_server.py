@@ -705,6 +705,7 @@ mcp = FastMCP(
     auth_server_provider=provider,
     auth=AuthSettings(
         issuer_url=MCP_BASE_URL,
+        resource_server_url=MCP_BASE_URL,
         service_documentation_url="https://github.com/thejeremyhodge/xireactor-brilliant",
         # Client registration is disabled. FastMCP will NOT mount /register
         # at all — a POST to /register returns 404 (Starlette default
