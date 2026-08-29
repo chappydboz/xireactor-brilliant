@@ -12,7 +12,7 @@ from psycopg_pool import PoolTimeout
 
 from database import init_pool, close_pool, get_pool
 from admin_bootstrap import ensure_admin_user
-from middleware.request_log import RequestLogMiddleware
+from middleware.request_log import RequestLogMiddleware, start_log_worker, stop_log_worker
 
 logger = logging.getLogger("brilliant.api")
 
