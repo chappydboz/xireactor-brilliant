@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
 
 from auth import UserContext, get_current_user
@@ -212,47 +213,55 @@ async def _promote_staging_item(conn, staging: dict, approver_id: str) -> dict:
             if isinstance(explicit_conflict_with, list) and explicit_conflict_with
             else None
         )
-        cur = await conn.execute(
-            """
-            INSERT INTO entries (
-                org_id, title, content, content_hash,
-                content_type, logical_path, sensitivity,
-                tags, domain_meta, source,
-                created_by, updated_by,
-                claim_type, source_confidence,
-                verification_status, conflict_with
-            ) VALUES (
-                %s, %s, %s, %s,
-                %s, %s, %s,
-                %s, %s, %s,
-                %s, %s,
-                %s, %s,
-                COALESCE(%s::verification_status_t, 'pending'::verification_status_t),
-                COALESCE(%s::uuid[], ARRAY[]::uuid[])
+        try:
+            cur = await conn.execute(
+                """
+                INSERT INTO entries (
+                    org_id, title, content, content_hash,
+                    content_type, logical_path, sensitivity,
+                    tags, domain_meta, source,
+                    created_by, updated_by,
+                    claim_type, source_confidence,
+                    verification_status, conflict_with
+                ) VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    COALESCE(%s::verification_status_t, 'pending'::verification_status_t),
+                    COALESCE(%s::uuid[], ARRAY[]::uuid[])
+                )
+                RETURNING id, version
+                """,
+                (
+                    staging["org_id"],
+                    staging["proposed_title"] or "Untitled",
+                    staging["proposed_content"],
+                    content_hash,
+                    content_type,
+                    staging["target_path"],
+                    sensitivity,
+                    tags,
+                    json.dumps(domain_meta),
+                    staging["source"],
+                    staging["submitted_by"],
+                    approver_id,
+                    effective_claim_type,
+                    effective_source_confidence,
+                    explicit_verification_status,
+                    conflict_with_val,
+                ),
             )
-            RETURNING id, version
-            """,
-            (
-                staging["org_id"],
-                staging["proposed_title"] or "Untitled",
-                staging["proposed_content"],
-                content_hash,
-                content_type,
-                staging["target_path"],
-                sensitivity,
-                tags,
-                json.dumps(domain_meta),
-                staging["source"],
-                staging["submitted_by"],
-                approver_id,
-                effective_claim_type,
-                effective_source_confidence,
-                explicit_verification_status,
-                conflict_with_val,
-            ),
-        )
-        cur.row_factory = dict_row
-        entry_row = await cur.fetchone()
+            cur.row_factory = dict_row
+            entry_row = await cur.fetchone()
+        except pg_errors.UniqueViolation as e:
+            if "entries_org_id_logical_path_key" in str(e):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Logical path '{staging['target_path']}' already exists.",
+                )
+            raise
 
         await conn.execute(
             """
@@ -642,6 +651,42 @@ async def submit_staging(
     )
 
     async with get_db(user) as conn:
+        # Resolve target_entry_id to full UUID if it's a short ID
+        resolved_target_id = None
+        if body.target_entry_id:
+            if len(body.target_entry_id) == 8 and all(c in "0123456789abcdefABCDEF" for c in body.target_entry_id):
+                cur_res = await conn.execute(
+                    "SELECT id FROM entries WHERE id::text LIKE %s",
+                    (f"{body.target_entry_id.lower()}%",),
+                )
+                row_res = await cur_res.fetchone()
+                if row_res:
+                    resolved_target_id = str(row_res[0])
+                else:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Target entry with short ID '{body.target_entry_id}' not found",
+                    )
+            else:
+                try:
+                    cur_res = await conn.execute(
+                        "SELECT id FROM entries WHERE id = %s",
+                        (body.target_entry_id,),
+                    )
+                    row_res = await cur_res.fetchone()
+                    if row_res:
+                        resolved_target_id = str(row_res[0])
+                    else:
+                        raise HTTPException(
+                            status_code=404,
+                            detail="Target entry not found",
+                        )
+                except pg_errors.InvalidTextRepresentation:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Target entry not found",
+                    )
+
         # Validate content_type against registry at submission time (not just promotion)
         effective_ct = (body.proposed_meta or {}).get("content_type")
         if effective_ct:
@@ -668,7 +713,7 @@ async def submit_staging(
             """,
             {
                 "org_id": user.org_id,
-                "target_entry_id": body.target_entry_id,
+                "target_entry_id": resolved_target_id,
                 "target_path": body.target_path,
                 "change_type": body.change_type,
                 "proposed_title": body.proposed_title,
@@ -691,10 +736,10 @@ async def submit_staging(
             escalation_reasons: list[str] = []
 
             # Optimistic concurrency check for update/append
-            if body.expected_version is not None and body.change_type in ("update", "append") and body.target_entry_id:
+            if body.expected_version is not None and body.change_type in ("update", "append") and resolved_target_id:
                 cur2 = await conn.execute(
                     "SELECT version FROM entries WHERE id = %s",
-                    (body.target_entry_id,),
+                    (resolved_target_id,),
                 )
                 version_row = await cur2.fetchone()
                 if version_row and version_row[0] != body.expected_version:
@@ -723,13 +768,13 @@ async def submit_staging(
                         escalation_reasons.append(f"Duplicate content_hash — matches entry {dup[0]}")
 
                 # Check for other pending items targeting the same entry
-                if body.target_entry_id:
+                if resolved_target_id:
                     cur4 = await conn.execute(
                         """
                         SELECT COUNT(*) FROM staging
                         WHERE target_entry_id = %s AND status = 'pending' AND id != %s
                         """,
-                        (body.target_entry_id, row["id"]),
+                        (resolved_target_id, row["id"]),
                     )
                     conflict_count = (await cur4.fetchone())[0]
                     if conflict_count > 0:

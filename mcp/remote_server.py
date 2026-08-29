@@ -25,6 +25,7 @@ import os
 import secrets
 import time
 
+import bcrypt
 import psycopg
 
 from mcp.server.auth.provider import (
@@ -479,13 +480,26 @@ class BrilliantOAuthProvider(
         client: OAuthClientInformationFull,
         authorization_code: BrilliantAuthorizationCode,
     ) -> OAuthToken:
-        # Consume the authorization code
-        await self.store.delete_auth_code(authorization_code.code)
-
         # Pull the user_id bound to this code; never let a NULL slip
         # through silently — a code minted by /oauth/continue will always
         # have a user_id set.
         bound_user_id = getattr(authorization_code, "user_id", None)
+        if not bound_user_id:
+            try:
+                async with await self.store._conn() as conn:
+                    row = await (
+                        await conn.execute(
+                            "SELECT user_id FROM oauth_auth_codes WHERE code = %s AND client_id = %s",
+                            (authorization_code.code, client.client_id),
+                        )
+                    ).fetchone()
+                    if row and row.get("user_id"):
+                        bound_user_id = row["user_id"]
+            except Exception as exc:
+                logger.warning("exchange_code: db fallback for user_id failed: %s", exc)
+
+        # Consume the authorization code
+        await self.store.delete_auth_code(authorization_code.code)
 
         # Issue access token
         access_token_str = secrets.token_hex(32)
@@ -528,6 +542,33 @@ class BrilliantOAuthProvider(
         request. The T-0229 follow-up reads ``.user_id`` off this object
         to populate ``X-Act-As-User`` on outbound API calls.
         """
+        # --- bkai_ personal token patch (Phase 2) ---
+        if token.startswith("bkai_"):
+            key_prefix = token[:9]
+            try:
+                async with await self.store._conn() as conn:  # noqa: SLF001
+                    row = await (
+                        await conn.execute(
+                            """SELECT user_id, key_hash FROM api_keys 
+                               WHERE key_prefix = %s AND is_revoked = FALSE
+                                 AND (expires_at IS NULL OR expires_at > NOW())""",
+                            (key_prefix,),
+                        )
+                    ).fetchone()
+                    if row:
+                        user_id, key_hash = row["user_id"], row["key_hash"]
+                        if bcrypt.checkpw(token.encode("utf-8"), key_hash.encode("utf-8")):
+                            logger.info("bkai_ token verified for user_id: %s", user_id)
+                            return BrilliantAccessToken(
+                                token=token,
+                                client_id="cortex_34c3aeb772906662ff042acf4ac206ef",
+                                scopes=["brilliant"],
+                                expires_at=int(time.time()) + 3600,
+                                user_id=user_id,
+                            )
+            except Exception as exc:
+                logger.error("bkai_ auth error: %s", exc)
+
         result = await self.store.get_access_token(token)
         if result is None:
             return None

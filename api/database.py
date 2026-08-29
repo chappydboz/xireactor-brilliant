@@ -39,10 +39,17 @@ def _sanitize(value: str) -> str:
 async def init_pool() -> AsyncConnectionPool:
     """Create and open the global connection pool."""
     global _pool
+    min_size = int(os.getenv("DB_POOL_MIN_SIZE", "5"))
+    max_size = int(os.getenv("DB_POOL_MAX_SIZE", "30"))
+    timeout = float(os.getenv("DB_POOL_TIMEOUT", "10.0"))
+    max_idle = float(os.getenv("DB_POOL_MAX_IDLE", "300.0"))
+
     _pool = AsyncConnectionPool(
         conninfo=DATABASE_URL,
-        min_size=2,
-        max_size=10,
+        min_size=min_size,
+        max_size=max_size,
+        timeout=timeout,
+        max_idle=max_idle,
         open=False,
     )
     await _pool.open()

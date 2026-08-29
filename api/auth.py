@@ -1,7 +1,12 @@
-"""API key authentication middleware for FastAPI."""
+"""API key authentication and RLS user context injection."""
 
+from __future__ import annotations
+
+import asyncio
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 import bcrypt
 from fastapi import Depends, HTTPException, Request
@@ -34,6 +39,12 @@ _KEY_TYPE_TO_SOURCE = {
     "service": "api",
 }
 
+# Cache for verified tokens: token -> (expires_at_timestamp, user_data_tuple)
+# user_data_tuple: (key_id, key_type, user_id, org_id, display_name, role, department)
+_TOKEN_AUTH_CACHE: dict[str, tuple[float, tuple[str, str, str, str, str, str, str | None]]] = {}
+_LAST_USED_THROTTLE: dict[str, float] = {}
+_AUTH_CACHE_TTL = 300.0  # 5 minutes
+
 
 def _extract_bearer_token(request: Request) -> str:
     """Extract Bearer token from Authorization header."""
@@ -46,109 +57,148 @@ def _extract_bearer_token(request: Request) -> str:
     return parts[1]
 
 
+async def _throttle_last_used_update(key_id: str) -> None:
+    """Update last_used_at at most once every 60s per key_id to eliminate row-lock contention."""
+    now = time.time()
+    last_updated = _LAST_USED_THROTTLE.get(key_id, 0.0)
+    if now - last_updated >= 60.0:
+        _LAST_USED_THROTTLE[key_id] = now
+        try:
+            pool = get_pool()
+            async with pool.connection() as conn:
+                await conn.execute(
+                    "UPDATE api_keys SET last_used_at = %s WHERE id = %s",
+                    (datetime.now(timezone.utc), key_id),
+                )
+        except Exception:
+            pass
+
+
 async def get_current_user(request: Request) -> UserContext:
     """FastAPI dependency that authenticates via API key and returns UserContext.
 
     Auth flow:
     1. Extract Bearer token from Authorization header
-    2. Lookup api_keys by key_prefix (first 8 chars)
-    3. bcrypt verify full token against key_hash
-    4. Join to users table for role, department, org_id, display_name
+    2. Check in-memory verified token cache
+    3. If cache miss:
+         - Lookup api_keys by key_prefix (first 9 chars)
+         - bcrypt verify full token in worker thread (non-blocking)
+         - Populate in-memory cache
+    4. Throttled update of last_used_at (max 1x per 60s per key)
     5. If X-Act-As-User header is present:
          - key_type must be 'service' (else 403)
          - load the target user row and return UserContext for *that* user
-           (RLS downstream scopes to the target user via app.user_id +
-           kb_* role); the service key owner's identity is intentionally
-           dropped so per-user RLS is enforced end-to-end.
     6. Map key_type to source
-    7. Update last_used_at
-    8. Return UserContext
+    7. Return UserContext
     """
     token = _extract_bearer_token(request)
 
     if len(token) < 9:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    # Key prefix format: bkai_XXXX (9 chars)
-    key_prefix = token[:9]
-
-    # Use a raw connection from the pool (not RLS-scoped) for auth queries
-    pool = get_pool()
-    async with pool.connection() as conn:
-        # Look up the API key by prefix
-        row = await conn.execute(
-            """
-            SELECT
-                ak.id AS key_id,
-                ak.key_hash,
-                ak.key_type,
-                ak.user_id,
-                u.org_id,
-                u.display_name,
-                u.role,
-                u.department
-            FROM api_keys ak
-            JOIN users u ON u.id = ak.user_id
-            WHERE ak.key_prefix = %s
-              AND ak.is_revoked = FALSE
-              AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
-            """,
-            (key_prefix,),
-        )
-        result = await row.fetchone()
-
-        if result is None:
-            raise HTTPException(status_code=401, detail="Invalid or expired API key")
-
+    now = time.time()
+    cached = _TOKEN_AUTH_CACHE.get(token)
+    if cached and cached[0] > now:
         (
             key_id,
-            key_hash,
             key_type,
             user_id,
             org_id,
             display_name,
             role,
             department,
-        ) = result
+        ) = cached[1]
+    else:
+        # Cache miss or expired — query DB and verify bcrypt in worker thread
+        key_prefix = token[:9]
+        pool = get_pool()
+        async with pool.connection() as conn:
+            row = await conn.execute(
+                """
+                SELECT
+                    ak.id AS key_id,
+                    ak.key_hash,
+                    ak.key_type,
+                    ak.user_id,
+                    u.org_id,
+                    u.display_name,
+                    u.role,
+                    u.department
+                FROM api_keys ak
+                JOIN users u ON u.id = ak.user_id
+                WHERE ak.key_prefix = %s
+                  AND ak.is_revoked = FALSE
+                  AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
+                """,
+                (key_prefix,),
+            )
+            result = await row.fetchone()
 
-        # bcrypt verify the full token against stored hash
-        if not bcrypt.checkpw(token.encode("utf-8"), key_hash.encode("utf-8")):
-            raise HTTPException(status_code=401, detail="Invalid API key")
+            if result is None:
+                raise HTTPException(status_code=401, detail="Invalid or expired API key")
 
-        # Update last_used_at
-        await conn.execute(
-            "UPDATE api_keys SET last_used_at = %s WHERE id = %s",
-            (datetime.now(timezone.utc), key_id),
-        )
+            (
+                key_id,
+                key_hash,
+                key_type,
+                user_id,
+                org_id,
+                display_name,
+                role,
+                department,
+            ) = result
 
-        # ------------------------------------------------------------------
-        # X-Act-As-User handling (service-role gate)
-        # ------------------------------------------------------------------
-        # A service-role key may present X-Act-As-User: <user_id> to act as
-        # a different end user — the MCP layer uses this to thread the
-        # OAuth-bound user_id into every API call so per-user RLS applies.
-        # Any non-service key presenting the header is a client-side bug
-        # or an abuse attempt; reject with 403.
-        act_as_user_id = request.headers.get("X-Act-As-User")
-        if act_as_user_id is not None:
-            act_as_user_id = act_as_user_id.strip()
-            if not act_as_user_id:
-                raise HTTPException(
-                    status_code=400,
-                    detail="X-Act-As-User header present but empty",
-                )
+            # bcrypt verify in background thread so event loop never blocks
+            is_valid = await asyncio.to_thread(
+                bcrypt.checkpw,
+                token.encode("utf-8"),
+                key_hash.encode("utf-8"),
+            )
+            if not is_valid:
+                raise HTTPException(status_code=401, detail="Invalid API key")
 
-            if key_type != "service":
-                raise HTTPException(
-                    status_code=403,
-                    detail=(
-                        "X-Act-As-User header is only honored on service-role "
-                        "API keys"
-                    ),
-                )
+            # Store in cache
+            if len(_TOKEN_AUTH_CACHE) > 2000:
+                _TOKEN_AUTH_CACHE.clear()
+            _TOKEN_AUTH_CACHE[token] = (
+                now + _AUTH_CACHE_TTL,
+                (
+                    str(key_id),
+                    key_type,
+                    str(user_id),
+                    str(org_id),
+                    display_name,
+                    role,
+                    department,
+                ),
+            )
 
-            # Load the target user. Must be active and in the same org as the
-            # service key's owner (belt-and-suspenders tenant isolation).
+    # Throttled update of last_used_at in background task
+    asyncio.create_task(_throttle_last_used_update(key_id))
+
+    # ------------------------------------------------------------------
+    # X-Act-As-User handling (service-role gate)
+    # ------------------------------------------------------------------
+    act_as_user_id = request.headers.get("X-Act-As-User")
+    if act_as_user_id is not None:
+        act_as_user_id = act_as_user_id.strip()
+        if not act_as_user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="X-Act-As-User header present but empty",
+            )
+
+        if key_type != "service":
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "X-Act-As-User header is only honored on service-role "
+                    "API keys"
+                ),
+            )
+
+        pool = get_pool()
+        async with pool.connection() as conn:
             cur = await conn.execute(
                 """
                 SELECT id, org_id, display_name, role, department
@@ -179,14 +229,9 @@ async def get_current_user(request: Request) -> UserContext:
                     detail="X-Act-As-User target belongs to a different org",
                 )
 
-            # Stash *target* identity on request.state so middleware (e.g.
-            # request_log + RLS session setup) scopes downstream queries to
-            # the acting user, not the service key owner.
             request.state.user_org_id = str(target_org_id)
             request.state.user_id = str(target_id)
 
-            # source: still reflects that the call came in on a service
-            # channel but the acting identity is the target user's.
             return UserContext(
                 id=str(target_id),
                 org_id=str(target_org_id),
@@ -194,30 +239,23 @@ async def get_current_user(request: Request) -> UserContext:
                 role=target_role,
                 department=target_department,
                 source="api",
-                # Preserve key_type='service' so downstream code can tell
-                # this request rode in on a service channel (useful for
-                # audit + debugging) without changing authorization — role
-                # is what gates access, and role is the target user's.
                 key_type="service",
             )
 
-        # ------------------------------------------------------------------
-        # No X-Act-As-User header → normal self-auth path.
-        # ------------------------------------------------------------------
-        source = _KEY_TYPE_TO_SOURCE.get(key_type, "api")
+    # ------------------------------------------------------------------
+    # No X-Act-As-User header → normal self-auth path.
+    # ------------------------------------------------------------------
+    source = _KEY_TYPE_TO_SOURCE.get(key_type, "api")
 
-        # Stash on request.state so downstream middleware (e.g. request_log)
-        # can read org and actor IDs after the handler returns. Safe to set
-        # even if no middleware reads them.
-        request.state.user_org_id = str(org_id)
-        request.state.user_id = str(user_id)
+    request.state.user_org_id = str(org_id)
+    request.state.user_id = str(user_id)
 
-        return UserContext(
-            id=str(user_id),
-            org_id=str(org_id),
-            display_name=display_name,
-            role=role,
-            department=department,
-            source=source,
-            key_type=key_type,
-        )
+    return UserContext(
+        id=str(user_id),
+        org_id=str(org_id),
+        display_name=display_name,
+        role=role,
+        department=department,
+        source=source,
+        key_type=key_type,
+    )

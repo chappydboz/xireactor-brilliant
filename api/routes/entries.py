@@ -4,6 +4,7 @@ import hashlib
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
 
 from auth import UserContext, get_current_user
@@ -84,6 +85,26 @@ _SELECT_COLS = """
     created_by, updated_by, created_at, updated_at
 """
 
+async def _get_entry_by_id_or_short_id(conn, entry_id: str) -> dict | None:
+    """Helper to fetch a single entry by its full UUID or 8-character short ID."""
+    if len(entry_id) == 8 and all(c in "0123456789abcdefABCDEF" for c in entry_id):
+        # Short ID lookup
+        cur = await conn.execute(
+            f"SELECT {_SELECT_COLS} FROM entries WHERE id::text LIKE %s",
+            (f"{entry_id.lower()}%",),
+        )
+    else:
+        try:
+            cur = await conn.execute(
+                f"SELECT {_SELECT_COLS} FROM entries WHERE id = %s",
+                (entry_id,),
+            )
+        except pg_errors.InvalidTextRepresentation:
+            return None
+    cur.row_factory = dict_row
+    return await cur.fetchone()
+
+
 
 def _require_non_agent(user: UserContext) -> None:
     """Raise 403 if the caller is using an agent key (agents must use staging)."""
@@ -137,42 +158,50 @@ async def create_entry(
         # Validate content_type against DB registry
         await _validate_content_type(conn, body.content_type)
 
-        cur = await conn.execute(
-            f"""
-            INSERT INTO entries (
-                org_id, title, content, summary, content_hash,
-                content_type, logical_path, sensitivity, department,
-                owner_id, project_id, tags, domain_meta,
-                source, created_by, updated_by
-            ) VALUES (
-                %(org_id)s, %(title)s, %(content)s, %(summary)s, %(content_hash)s,
-                %(content_type)s, %(logical_path)s, %(sensitivity)s, %(department)s,
-                %(owner_id)s, %(project_id)s, %(tags)s, %(domain_meta)s,
-                %(source)s, %(created_by)s, %(updated_by)s
+        try:
+            cur = await conn.execute(
+                f"""
+                INSERT INTO entries (
+                    org_id, title, content, summary, content_hash,
+                    content_type, logical_path, sensitivity, department,
+                    owner_id, project_id, tags, domain_meta,
+                    source, created_by, updated_by
+                ) VALUES (
+                    %(org_id)s, %(title)s, %(content)s, %(summary)s, %(content_hash)s,
+                    %(content_type)s, %(logical_path)s, %(sensitivity)s, %(department)s,
+                    %(owner_id)s, %(project_id)s, %(tags)s, %(domain_meta)s,
+                    %(source)s, %(created_by)s, %(updated_by)s
+                )
+                RETURNING {_SELECT_COLS}
+                """,
+                {
+                    "org_id": user.org_id,
+                    "title": body.title,
+                    "content": body.content,
+                    "summary": body.summary,
+                    "content_hash": content_hash,
+                    "content_type": body.content_type,
+                    "logical_path": body.logical_path,
+                    "sensitivity": sensitivity,
+                    "department": body.department,
+                    "owner_id": user.id,
+                    "project_id": body.project_id,
+                    "tags": body.tags,
+                    "domain_meta": json.dumps(body.domain_meta),
+                    "source": user.source,
+                    "created_by": user.id,
+                    "updated_by": user.id,
+                },
             )
-            RETURNING {_SELECT_COLS}
-            """,
-            {
-                "org_id": user.org_id,
-                "title": body.title,
-                "content": body.content,
-                "summary": body.summary,
-                "content_hash": content_hash,
-                "content_type": body.content_type,
-                "logical_path": body.logical_path,
-                "sensitivity": sensitivity,
-                "department": body.department,
-                "owner_id": user.id,
-                "project_id": body.project_id,
-                "tags": body.tags,
-                "domain_meta": json.dumps(body.domain_meta),
-                "source": user.source,
-                "created_by": user.id,
-                "updated_by": user.id,
-            },
-        )
-        cur.row_factory = dict_row
-        row = await cur.fetchone()
+            cur.row_factory = dict_row
+            row = await cur.fetchone()
+        except pg_errors.UniqueViolation as e:
+            if "entries_org_id_logical_path_key" in str(e):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Logical path '{body.logical_path}' already exists.",
+                )
+            raise
 
         # Personal-zones safety invariant (Sprint 0051): any new private entry
         # gets an additive `admin` grant for the caller's zone group. Same
@@ -209,12 +238,7 @@ async def get_entry(
 ):
     """Get a single entry by ID. RLS handles permission scoping."""
     async with get_db(user) as conn:
-        cur = await conn.execute(
-            f"SELECT {_SELECT_COLS} FROM entries WHERE id = %s",
-            (entry_id,),
-        )
-        cur.row_factory = dict_row
-        row = await cur.fetchone()
+        row = await _get_entry_by_id_or_short_id(conn, entry_id)
 
         if row is None:
             raise HTTPException(status_code=404, detail="Entry not found")
@@ -323,10 +347,10 @@ async def list_entries(
 
     # Determine ordering: rank by relevance if searching, otherwise by updated_at
     if q:
-        order_clause = "ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', %s)) DESC"
+        order_clause = "ORDER BY occurred_at DESC, ts_rank(search_vector, websearch_to_tsquery('english', %s)) DESC"
         order_params = [q]
     else:
-        order_clause = "ORDER BY updated_at DESC"
+        order_clause = "ORDER BY occurred_at DESC, updated_at DESC"
         order_params = []
 
     async with get_db(user) as conn:
@@ -437,12 +461,7 @@ async def update_entry(
 
     async with get_db(user) as conn:
         # Fetch current entry
-        cur = await conn.execute(
-            f"SELECT {_SELECT_COLS} FROM entries WHERE id = %s",
-            (entry_id,),
-        )
-        cur.row_factory = dict_row
-        current = await cur.fetchone()
+        current = await _get_entry_by_id_or_short_id(conn, entry_id)
 
         if current is None:
             raise HTTPException(status_code=404, detail="Entry not found")
@@ -529,7 +548,7 @@ async def update_entry(
             set_params.append(val)
 
         set_clause = ", ".join(set_parts)
-        set_params.append(entry_id)
+        set_params.append(current["id"])
 
         cur = await conn.execute(
             f"""
@@ -572,12 +591,7 @@ async def append_entry(
 
     async with get_db(user) as conn:
         # Fetch current entry
-        cur = await conn.execute(
-            f"SELECT {_SELECT_COLS} FROM entries WHERE id = %s",
-            (entry_id,),
-        )
-        cur.row_factory = dict_row
-        current = await cur.fetchone()
+        current = await _get_entry_by_id_or_short_id(conn, entry_id)
 
         if current is None:
             raise HTTPException(status_code=404, detail="Entry not found")
@@ -643,7 +657,7 @@ async def append_entry(
                 new_version,
                 user.id,
                 user.source,
-                entry_id,
+                current["id"],
             ),
         )
         cur.row_factory = dict_row
@@ -676,14 +690,15 @@ async def delete_entry(
     _require_non_agent(user)
 
     async with get_db(user) as conn:
-        cur = await conn.execute(
-            "UPDATE entries SET status = 'archived', updated_by = %s WHERE id = %s RETURNING id",
-            (user.id, entry_id),
-        )
-        row = await cur.fetchone()
-
+        row = await _get_entry_by_id_or_short_id(conn, entry_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Entry not found")
+
+        cur = await conn.execute(
+            "UPDATE entries SET status = 'archived', updated_by = %s WHERE id = %s RETURNING id",
+            (user.id, row["id"]),
+        )
+        await cur.fetchone()
 
         return {"message": "Entry archived"}
 
@@ -702,6 +717,10 @@ async def list_entry_attachments(
     no attachments, which keeps cross-org probing quiet.
     """
     async with get_db(user) as conn:
+        row = await _get_entry_by_id_or_short_id(conn, entry_id)
+        if row is None:
+            return []
+
         cur = await conn.execute(
             """
             SELECT
@@ -719,7 +738,7 @@ async def list_entry_attachments(
             WHERE ea.entry_id = %s
             ORDER BY ea.created_at ASC
             """,
-            (entry_id,),
+            (row["id"],),
         )
         cur.row_factory = dict_row
         rows = await cur.fetchall()

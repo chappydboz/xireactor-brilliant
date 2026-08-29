@@ -89,6 +89,40 @@ def _resolve_act_as_user_id() -> str | None:
     # ``AccessToken`` sneaking through (would still raise below).
     user_id = getattr(access_token, "user_id", None)
     if not user_id:
+        # Fallback: query the DB to resolve the user_id for this access token.
+        # This handles cases where the FastMCP auth middleware strips subclass fields.
+        token_str = access_token.token
+        import os
+        db_url = os.getenv("DATABASE_URL")
+        if db_url and token_str:
+            try:
+                import psycopg
+                with psycopg.connect(db_url) as conn:
+                    with conn.cursor() as cur:
+                        if token_str.startswith("bkai_"):
+                            key_prefix = token_str[:9]
+                            cur.execute(
+                                """SELECT user_id FROM api_keys 
+                                   WHERE key_prefix = %s AND is_revoked = FALSE
+                                     AND (expires_at IS NULL OR expires_at > NOW())""",
+                                (key_prefix,),
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                user_id = row[0]
+                        else:
+                            cur.execute(
+                                "SELECT user_id FROM oauth_access_tokens WHERE token = %s",
+                                (token_str,),
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                user_id = row[0]
+            except Exception as exc:
+                # Let it fallback or raise below
+                pass
+
+    if not user_id:
         raise ToolError(
             "Authenticated token is missing a bound user_id. "
             "Re-authenticate via the OAuth login flow."

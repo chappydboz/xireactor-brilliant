@@ -72,6 +72,7 @@ class EntryCreate(BaseModel):
     # `conflict_with=[]`).
     claim_type: ClaimType | None = None
     source_confidence: SourceConfidence | None = None
+    occurred_at: datetime | None = None
 
 
 class EntryUpdate(BaseModel):
@@ -91,12 +92,14 @@ class EntryUpdate(BaseModel):
     source_confidence: SourceConfidence | None = None
     verification_status: VerificationStatus | None = None
     conflict_with: list[str] | None = None
+    occurred_at: datetime | None = None
 
 
 class EntryAppend(BaseModel):
     content: str  # content to append
     separator: str = "\n\n"  # separator between existing and new content
     expected_version: int | None = None
+    occurred_at: datetime | None = None
 
 
 class EntryResponse(BaseModel):
@@ -127,6 +130,7 @@ class EntryResponse(BaseModel):
     source_confidence: SourceConfidence | None = None
     verification_status: VerificationStatus | None = None
     conflict_with: list[str] = []
+    occurred_at: datetime | None = None
 
 
 class EntryList(BaseModel):
@@ -197,6 +201,7 @@ class GraphNode(BaseModel):
     logical_path: str
     summary: str | None
     updated_at: datetime
+    occurred_at: datetime | None = None
 
 
 class GraphEdge(BaseModel):
@@ -231,6 +236,7 @@ class IndexEntry(BaseModel):
     content_type: str
     logical_path: str
     updated_at: datetime
+    occurred_at: datetime | None = None
 
 
 class IndexRelationship(BaseModel):
@@ -271,6 +277,7 @@ class StagingSubmit(BaseModel):
     # are NOT accepted on submit — they are written by the reviewer agent.
     claim_type: ClaimType | None = None
     source_confidence: SourceConfidence | None = None
+    occurred_at: datetime | None = None
 
 
 class StagingResponse(BaseModel):

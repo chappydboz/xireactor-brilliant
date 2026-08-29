@@ -76,17 +76,14 @@ async def _publish_public_url_to_db(pool) -> None:
 
 
 def _log_ready_banner() -> None:
-    """Emit an unmistakable "ready" marker for operators watching Render logs.
+    """Sprint 0044 T-0268: emit the single deterministic 'READY' banner.
 
-    A fresh Render deploy can take ~3-4 min from "deploy started" to "edge
-    routing live". Without an explicit marker, a non-technical operator
-    watching the log stream has no signal for when it's safe to click the
-    setup link. This banner is the signal: when this line scrolls past,
-    open the URL.
+    Operators (and install.sh / tests) look for this exact line in container
+    logs to confirm the stack is healthy.
     """
-    public_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-    setup_url = f"{public_url}/setup" if public_url else "http://localhost:8010/setup"
-    bar = "=" * 64
+    mcp_url = os.environ.get("MCP_PUBLIC_URL", "http://localhost:8001")
+    setup_url = f"{mcp_url}/auth/login"
+    bar = "=" * 70
     # WARNING level (not INFO) so the banner survives the default
     # logger threshold — `brilliant.api` has no handler/level config,
     # so info() falls through Python's lastResort and gets dropped.
@@ -102,8 +99,10 @@ async def lifespan(app: FastAPI):
     await init_pool()
     await _publish_public_url_to_db(get_pool())
     await ensure_admin_user(get_pool())
+    await start_log_worker()
     _log_ready_banner()
     yield
+    await stop_log_worker()
     await close_pool()
 
 

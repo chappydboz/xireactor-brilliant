@@ -9,3 +9,4 @@ starlette<1.0
 uvicorn<0.46
 httpx>=0.27
 psycopg[binary]>=3.1
+bcrypt
